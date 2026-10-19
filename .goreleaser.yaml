@@ -17,7 +17,7 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X github.com/aocybersystems/eden/cli/internal/command.version={{.Version}}
+      - -X go.aocyber.ai/eden-cli/internal/command.version={{.Version}}
 
 archives:
   - id: eden
