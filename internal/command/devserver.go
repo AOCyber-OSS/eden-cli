@@ -17,6 +17,7 @@ import (
 var (
 	teardownForce        bool
 	daemonHighPort       bool
+	daemonAllowLAN       bool
 	androidReversePorts  []int
 )
 
@@ -33,6 +34,7 @@ func init() {
 
 	devTeardownCmd.Flags().BoolVar(&teardownForce, "force", false, "Remove CA certificates without prompting")
 	devDaemonCmd.Flags().BoolVar(&daemonHighPort, "high-ports", false, "Use ports 9280/9283 instead of 80/443 (no LaunchAgent needed)")
+	devDaemonCmd.Flags().BoolVar(&daemonAllowLAN, "lan", false, "Expose the proxy on all network interfaces (default: loopback only). Anyone on the network can then reach linked workspaces")
 	devAndroidReverseCmd.Flags().IntSliceVar(&androidReversePorts, "ports", nil, "Additional ports to forward (e.g. --ports 9300,9301)")
 }
 
@@ -67,6 +69,10 @@ func runDevSetup(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("creating CA: %w", err)
 	}
 	fmt.Println("  CA certificate ready")
+	if ca.Replaced() {
+		fmt.Println("  Replaced the previous CA (expired or missing name constraints); it will be removed from the keychain")
+		fmt.Println("  If you use the iOS simulator, re-run: eden dev trust-simulator")
+	}
 
 	certPath := ca.CertPEMPath(caDir)
 	if err := daemon.TrustCA(certPath); err != nil {
@@ -92,13 +98,17 @@ func runDevSetup(cmd *cobra.Command, _ []string) error {
 	}
 	fmt.Println("  Installed LaunchAgent plist")
 
-	// 4. Load LaunchAgent.
+	// 4. (Re)load LaunchAgent: unload first so an already-running daemon is
+	// replaced by the current binary and plist (an unload of a job that is
+	// not loaded just fails, which is fine).
 	plistPath, _ := launchAgentPlistPath()
-	loadCmd := exec.CommandContext(cmd.Context(), "launchctl", "load", plistPath)
+	reload := launchAgentReloadCmds(plistPath)
+	_ = exec.CommandContext(cmd.Context(), reload[0][0], reload[0][1:]...).Run()
+	loadCmd := exec.CommandContext(cmd.Context(), reload[1][0], reload[1][1:]...)
 	loadCmd.Stdout = os.Stdout
 	loadCmd.Stderr = os.Stderr
 	if err := loadCmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "  Warning: launchctl load failed (daemon may already be loaded): %v\n", err)
+		fmt.Fprintf(os.Stderr, "  Warning: launchctl load failed: %v\n", err)
 	} else {
 		fmt.Println("  Loaded LaunchAgent")
 	}
@@ -295,6 +305,10 @@ var devDaemonCmd = &cobra.Command{
 	Long: `Starts the Eden dev server daemon in the foreground. This is normally
 invoked by the LaunchAgent, but can be run directly for debugging.
 
+The proxy listens on loopback only. Pass --lan to expose it on every network
+interface (for example, to reach it from a physical device); anyone on that
+network can then reach your linked workspaces.
+
 Press Ctrl-C to stop.`,
 	RunE: runDevDaemon,
 }
@@ -305,6 +319,7 @@ func runDevDaemon(cmd *cobra.Command, _ []string) error {
 
 	cfg := daemon.DefaultConfig()
 	cfg.HighPorts = daemonHighPort
+	cfg.AllowLAN = daemonAllowLAN
 
 	d := &daemon.Daemon{
 		Config: cfg,
@@ -453,7 +468,25 @@ func writeLaunchAgentPlist() error {
 		return err
 	}
 
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+	plist := launchAgentPlist(edenBin, logsDir)
+
+	return os.WriteFile(plistPath, []byte(plist), 0o644)
+}
+
+// launchAgentReloadCmds returns the launchctl commands setup runs to (re)load
+// the LaunchAgent: unload, then load. `launchctl load` alone fails on an
+// already-loaded job and leaves the old daemon process and plist running.
+func launchAgentReloadCmds(plistPath string) [][]string {
+	return [][]string{
+		{"launchctl", "unload", plistPath},
+		{"launchctl", "load", plistPath},
+	}
+}
+
+// launchAgentPlist renders the LaunchAgent plist. It declares no launchd
+// Sockets: the daemon binds its own (loopback-only) listeners.
+func launchAgentPlist(edenBin, logsDir string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -473,30 +506,7 @@ func writeLaunchAgentPlist() error {
 	<string>%s/daemon.log</string>
 	<key>StandardErrorPath</key>
 	<string>%s/daemon.err.log</string>
-	<key>Sockets</key>
-	<dict>
-		<key>http</key>
-		<dict>
-			<key>SockServiceName</key>
-			<string>http</string>
-			<key>SockType</key>
-			<string>stream</string>
-			<key>SockFamily</key>
-			<string>IPv4</string>
-		</dict>
-		<key>https</key>
-		<dict>
-			<key>SockServiceName</key>
-			<string>https</string>
-			<key>SockType</key>
-			<string>stream</string>
-			<key>SockFamily</key>
-			<string>IPv4</string>
-		</dict>
-	</dict>
 </dict>
 </plist>
 `, daemon.LaunchAgentLabel, edenBin, logsDir, logsDir)
-
-	return os.WriteFile(plistPath, []byte(plist), 0o644)
 }

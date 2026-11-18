@@ -16,6 +16,7 @@ type Config struct {
 	IdleTimeout time.Duration // default 15min
 	Domain      string        // default "eden.test"
 	HighPorts   bool          // use unprivileged ports (9280/9283) instead of 80/443
+	AllowLAN    bool          // expose the proxy on every interface (default: loopback only)
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -86,7 +87,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	// Create reverse proxy.
-	d.proxy = NewProxy(d.State, ca, d.Config.Domain, httpPort, httpsPort)
+	// ReloadingCA: `eden dev setup` may replace the CA while the daemon runs.
+	d.proxy = d.newProxy(NewReloadingCA(caDir, ca), httpPort, httpsPort)
 
 	// Create process pool and wire it into the proxy.
 	logsDir, err := LogsDir()
@@ -128,6 +130,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	return d.Shutdown()
+}
+
+// newProxy builds the reverse proxy from the daemon config.
+func (d *Daemon) newProxy(certs CertProvider, httpPort, httpsPort int) *Proxy {
+	p := NewProxy(d.State, certs, d.Config.Domain, httpPort, httpsPort)
+	p.AllowLAN = d.Config.AllowLAN
+	return p
 }
 
 // Shutdown gracefully stops all daemon subsystems. Process pool is stopped

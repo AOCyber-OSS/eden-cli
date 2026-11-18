@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -12,7 +13,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -33,12 +36,22 @@ type Proxy struct {
 	httpsPort int    // 443 or 9283
 	httpSrv   *http.Server
 	httpsSrv  *http.Server
+	listeners []net.Listener
 	startTime time.Time
 
 	// OnRequest is an optional callback for process pool integration (TRD-04).
 	// Called with the workspace name before proxying. Returns the backend port
 	// or an error. If nil, the proxy looks up the port from State directly.
 	OnRequest func(ctx context.Context, name string) (int, error)
+
+	// AllowLAN exposes the proxy on every interface. Off by default: anyone
+	// on the network could otherwise send a *.eden.test Host header and reach
+	// (and on-demand start) the developer's linked servers. Set only by the
+	// explicit `eden dev daemon --lan` opt-in.
+	AllowLAN bool
+
+	// listenFn binds a listener; net.Listen unless a test replaces it.
+	listenFn func(network, addr string) (net.Listener, error)
 }
 
 // NewProxy creates a new Proxy. The certs parameter may be nil, in which case
@@ -51,57 +64,125 @@ func NewProxy(state *State, certs CertProvider, domain string, httpPort, httpsPo
 		httpPort:  httpPort,
 		httpsPort: httpsPort,
 		startTime: time.Now(),
+		listenFn:  net.Listen,
 	}
 }
 
 // ListenAndServe starts both the HTTP redirect server and the HTTPS proxy
-// server. It blocks until both servers have stopped or ctx is cancelled.
+// server. It returns a bind error immediately; otherwise it blocks until ctx
+// is cancelled.
 func (p *Proxy) ListenAndServe(ctx context.Context) error {
-	errCh := make(chan error, 2)
+	if err := p.Start(); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return nil
+}
 
+// Start binds the HTTP and (when certs are set) HTTPS listeners and serves
+// them in the background. Call Shutdown to stop them.
+func (p *Proxy) Start() error {
 	// HTTP server: redirects to HTTPS (except health check).
 	p.httpSrv = &http.Server{
-		Addr:              fmt.Sprintf(":%d", p.httpPort),
 		Handler:           http.HandlerFunc(p.handleHTTP),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
-	go func() {
-		slog.Info("HTTP redirect server starting", "port", p.httpPort)
-		if err := p.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- fmt.Errorf("HTTP server: %w", err)
-			return
-		}
-		errCh <- nil
-	}()
+	httpLns, err := p.listen(p.httpPort)
+	if err != nil {
+		return fmt.Errorf("HTTP server: %w", err)
+	}
+	for _, ln := range httpLns {
+		p.serve(ln, "HTTP redirect server", func(l net.Listener) error { return p.httpSrv.Serve(l) })
+	}
 
 	// HTTPS server: reverse proxy with TLS.
 	if p.certs != nil {
-		tlsCfg := &tls.Config{
-			GetCertificate: p.certs.GetCertificate,
-			MinVersion:     tls.VersionTLS12,
-		}
 		p.httpsSrv = &http.Server{
-			Addr:              fmt.Sprintf(":%d", p.httpsPort),
-			Handler:           http.HandlerFunc(p.handleHTTPS),
-			TLSConfig:         tlsCfg,
+			Handler: http.HandlerFunc(p.handleHTTPS),
+			TLSConfig: &tls.Config{
+				GetCertificate: p.certs.GetCertificate,
+				MinVersion:     tls.VersionTLS12,
+			},
 			ReadHeaderTimeout: 10 * time.Second,
 		}
+		httpsLns, err := p.listen(p.httpsPort)
+		if err != nil {
+			p.closeListeners()
+			return fmt.Errorf("HTTPS server: %w", err)
+		}
+		for _, ln := range httpsLns {
+			// Empty cert/key: tls.Config.GetCertificate supplies them.
+			p.serve(ln, "HTTPS proxy server", func(l net.Listener) error { return p.httpsSrv.ServeTLS(l, "", "") })
+		}
+	}
+	return nil
+}
 
-		go func() {
-			slog.Info("HTTPS proxy server starting", "port", p.httpsPort)
-			// ListenAndServeTLS with empty cert/key because tls.Config.GetCertificate handles it.
-			if err := p.httpsSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-				errCh <- fmt.Errorf("HTTPS server: %w", err)
-				return
-			}
-			errCh <- nil
-		}()
+// listen binds the listener(s) for one port: IPv4 and IPv6 loopback, or every
+// interface when AllowLAN is set.
+//
+// macOS lets an unprivileged process bind a port below 1024 only on the
+// wildcard address; 127.0.0.1:80 and 127.0.0.1:443 fail with EACCES. In that
+// case listen binds the wildcard address but wraps it in loopbackOnlyListener,
+// so the default stays loopback-only without needing root.
+func (p *Proxy) listen(port int) ([]net.Listener, error) {
+	portStr := strconv.Itoa(port)
+	if p.AllowLAN {
+		slog.Warn("proxy: LAN exposure enabled; linked workspaces are reachable from the network", "port", port)
+		ln, err := p.listenFn("tcp", net.JoinHostPort("", portStr))
+		if err != nil {
+			return nil, err
+		}
+		return []net.Listener{ln}, nil
 	}
 
-	// Wait for context cancellation.
-	<-ctx.Done()
-	return nil
+	v4, err := p.listenFn("tcp", net.JoinHostPort("127.0.0.1", portStr))
+	if errors.Is(err, syscall.EACCES) {
+		ln, werr := p.listenFn("tcp", net.JoinHostPort("", portStr))
+		if werr != nil {
+			return nil, werr
+		}
+		slog.Info("proxy: loopback bind needs root on this port; serving the wildcard address restricted to loopback peers", "port", port)
+		return []net.Listener{loopbackOnlyListener{ln}}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	lns := []net.Listener{v4}
+	if v6, err := p.listenFn("tcp", net.JoinHostPort("::1", portStr)); err == nil {
+		lns = append(lns, v6)
+	} else {
+		slog.Warn("proxy: IPv6 loopback unavailable, serving IPv4 loopback only", "port", port, "error", err)
+	}
+	return lns, nil
+}
+
+// serve records ln and serves it in the background.
+func (p *Proxy) serve(ln net.Listener, what string, serveFn func(net.Listener) error) {
+	p.listeners = append(p.listeners, ln)
+	slog.Info(what+" starting", "addr", ln.Addr().String())
+	go func() {
+		if err := serveFn(ln); err != nil && err != http.ErrServerClosed {
+			slog.Error(what+" stopped", "addr", ln.Addr().String(), "error", err)
+		}
+	}()
+}
+
+// closeListeners closes every listener bound so far (used when a later bind
+// fails part-way through Start).
+func (p *Proxy) closeListeners() {
+	for _, ln := range p.listeners {
+		_ = ln.Close()
+	}
+}
+
+// Addrs returns the addresses the proxy is listening on.
+func (p *Proxy) Addrs() []net.Addr {
+	addrs := make([]net.Addr, 0, len(p.listeners))
+	for _, ln := range p.listeners {
+		addrs = append(addrs, ln.Addr())
+	}
+	return addrs
 }
 
 // Shutdown gracefully stops both HTTP and HTTPS servers.
@@ -447,3 +528,25 @@ var errorTmpl = template.Must(template.New("error").Funcs(template.FuncMap{
 </body>
 </html>
 `))
+
+// loopbackOnlyListener accepts only connections whose peer is a loopback
+// address and closes every other one before a byte is read. It guards the
+// wildcard fallback in listen: off-host clients can complete a TCP handshake
+// but can never send a request.
+type loopbackOnlyListener struct {
+	net.Listener
+}
+
+func (l loopbackOnlyListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if tcp, ok := c.RemoteAddr().(*net.TCPAddr); ok && tcp.IP.IsLoopback() {
+			return c, nil
+		}
+		slog.Debug("proxy: refused non-loopback connection", "remote", c.RemoteAddr().String())
+		_ = c.Close()
+	}
+}
